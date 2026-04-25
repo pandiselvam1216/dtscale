@@ -21,9 +21,9 @@ export interface SearchResponse {
   aiOverview: AIOverview;
 }
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
-async function callGeminiWithRetry(apiKey: string, prompt: string, retries = 3, tools?: any[]): Promise<string> {
+async function callGeminiWithRetry(apiKey: string, prompt: string, retries = 3, tools?: any[], config?: any): Promise<any> {
   const systemInstruction = `### SYSTEM ROLE: SEARCH-GROUNDED BRAND AUDITOR
 You are a specialized AI Auditor for the NeuraGlobal ecosystem. Your goal is to replicate the "Gemini Search Grounding" logic: prioritizing factual, live-web evidence over internal training data.
 
@@ -58,7 +58,7 @@ Return ONLY valid JSON. Keep keys consistent.`;
       const body: any = {
         contents: [{ parts: [{ text: prompt }] }],
         system_instruction: { parts: [{ text: systemInstruction }] },
-        generationConfig: {
+        generationConfig: config || {
           temperature: 0.0,
           maxOutputTokens: 4096,
           responseMimeType: "application/json",
@@ -77,9 +77,7 @@ Return ONLY valid JSON. Keep keys consistent.`;
 
       if (response.ok) {
         const data = await response.json();
-        const textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!textContent) throw new Error('Empty AI response');
-        return textContent;
+        return data;
       }
 
       const retriable = [429, 500, 503, 504];
@@ -104,36 +102,66 @@ export async function fetchSearchResults(keyword: string): Promise<SearchRespons
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('API Key missing');
 
-  const prompt = `Perform a SEARCH-GROUNDED BRAND AUDIT for: "${keyword}".
-  
-  ### Audit Parameters:
-  - Generate 3-5 search queries to triangulate the most authoritative results.
-  - Return exactly 15 results from the Google Search Index.
-  - In the "summary", identify the "Identity Consensus" and highlight any "Identity Gaps" between current search results and general AI memory.
-  - Ensure the "results" array in your JSON contains exactly 15 items.`;
+  const prompt = `Search the web for: "${keyword}"
+
+Using your google_search tool, find the top 15 real search results for this keyword. Then return them as a JSON object with this exact structure:
+{
+  "results": [
+    { "position": 1, "title": "...", "url": "...", "snippet": "..." },
+    ...up to 15 items
+  ],
+  "aiOverview": {
+    "summary": "2-3 sentence summary of what these results reveal about this keyword's search landscape.",
+    "attributions": []
+  }
+}
+Return ONLY valid JSON. No markdown, no explanation.`;
 
   const tools = [{ google_search: {} }];
-  const textContent = await callGeminiWithRetry(apiKey, prompt, 3, tools);
+  const data = await callGeminiWithRetry(apiKey, prompt, 3, tools);
+  
+  const candidate = data.candidates?.[0];
+  const groundingChunks = candidate?.groundingMetadata?.groundingChunks;
+
+  if (groundingChunks && groundingChunks.length > 0) {
+    // Build results from real grounded data
+    return {
+      results: groundingChunks.slice(0, 15).map((chunk: any, i: number) => ({
+        position: i + 1,
+        title: chunk.web?.title || 'Untitled',
+        url: chunk.web?.uri || '#',
+        snippet: chunk.web?.snippet || 'No description.',
+      })),
+      aiOverview: {
+        summary: candidate?.content?.parts?.[0]?.text || 'No summary available.',
+        attributions: [],
+      },
+    };
+  }
+
+  // Fall back to existing text JSON parsing only if groundingChunks is missing
+  const textContent = candidate?.content?.parts?.[0]?.text;
+  if (!textContent) throw new Error('Failed to parse AI results.');
 
   let jsonString = textContent.trim();
   const start = jsonString.indexOf('{');
   const end = jsonString.lastIndexOf('}');
   if (start !== -1 && end !== -1) jsonString = jsonString.substring(start, end + 1);
 
-  const data = JSON.parse(jsonString);
+  const parsed = JSON.parse(jsonString);
   
-  if (data.results && Array.isArray(data.results)) {
+  if (parsed.results && Array.isArray(parsed.results)) {
     return {
-      results: data.results.slice(0, 15).map((r: any, i: number) => ({
+      results: parsed.results.slice(0, 15).map((r: any, i: number) => ({
         position: i + 1,
         title: String(r.title || 'Untitled Result'),
         url: String(r.url || '#'),
         snippet: String(r.snippet || 'No description.'),
       })),
       aiOverview: {
-        summary: String(data.aiOverview?.summary || data.summary || 'No summary available.'),
-        attributions: Array.isArray(data.aiOverview?.attributions || data.attributions) 
-          ? (data.aiOverview?.attributions || data.attributions).map((a: any) => ({
+        summary: String(parsed.aiOverview?.summary || parsed.summary || 'No summary available.'),
+        attributions: Array.isArray(parsed.aiOverview?.attributions || parsed.attributions) 
+          ? (parsed.aiOverview?.attributions || parsed.attributions).map((a: any) => ({
               sentence: String(a.sentence || ''),
               sourcePosition: Math.max(1, Math.min(15, Number(a.sourcePosition || a.position || 1))),
               contributionScore: Math.max(1, Number(a.contributionScore || a.score || 10)),
@@ -144,6 +172,25 @@ export async function fetchSearchResults(keyword: string): Promise<SearchRespons
   }
 
   throw new Error('Failed to parse AI results.');
+}
+
+export function normalizeUrl(url: string): string {
+  return url
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/$/, '');
+}
+
+export function urlsMatch(targetUrl: string, resultUrl: string): boolean {
+  const normalTarget = normalizeUrl(targetUrl);
+  const normalResult = normalizeUrl(resultUrl);
+  // Exact match or one contains the other
+  if (normalResult.includes(normalTarget) || normalTarget.includes(normalResult)) return true;
+  // Domain-level match
+  const targetDomain = normalTarget.split('/')[0];
+  const resultDomain = normalResult.split('/')[0];
+  return targetDomain === resultDomain;
 }
 
 function getMockRankFeedback(keyword: string, targetUrl: string, position: number | null): string {
@@ -161,7 +208,8 @@ export async function generateRankCheckFeedback(keyword: string, targetUrl: stri
   const prompt = `Provide 1-2 sentences of professional SEO advice for "${targetUrl}" regarding "${keyword}". Status: ${status}. Be concise and professional.`;
 
   try {
-    return await callGeminiWithRetry(apiKey, prompt, 1);
+    const data = await callGeminiWithRetry(apiKey, prompt, 1);
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || getMockRankFeedback(keyword, targetUrl, position);
   } catch (err) {
     console.warn('Gemini feedback failed, using mock:', err);
     return getMockRankFeedback(keyword, targetUrl, position);
@@ -208,92 +256,47 @@ Return a JSON object with:
 IMPORTANT: Base score and verdict on regional context (India/Bharat) for .in domains.`;
 
   const tools = [{ google_search: {} }]; 
-  const textContent = await callGeminiWithRetry(apiKey, prompt, 3, tools);
-
-  let jsonString = textContent.trim();
-  const start = jsonString.indexOf('{');
-  const end = jsonString.lastIndexOf('}');
-  if (start !== -1 && end !== -1) jsonString = jsonString.substring(start, end + 1);
-
-  // Robust cleanup: Remove trailing commas before closing braces/brackets
-  jsonString = jsonString.replace(/,\s*([\]}])/g, '$1');
-
-  // Extract high-level fields via regex as strong fallbacks
-  // 1. Ultimate Mega-Regex (Multi-pass raw text scanning)
-  const verdictRegex = /"(?:verdict|analysis|summary|assessment)":\s*"([^"]+)"/i;
-  const scoreRegex = /"(?:visibilityScore|score|impact|visibility|magnitude)":\s*(\d+)/i;
-  let verdictMatch = textContent.match(verdictRegex);
-  let scoreMatch = textContent.match(scoreRegex);
-
-  // Second pass: Raw text patterns (if JSON keys failed)
-  if (!verdictMatch) verdictMatch = textContent.match(/(?:Verdict|Analysis|Summary|Assessment)\D*:\s*([^}\n"]+)/i);
-  if (!scoreMatch) scoreMatch = textContent.match(/(?:Visibility|Score|Impact|Magnitude)\D*(\d{1,3})/i);
-
-  const pageObjects: any[] = [];
-  const allObjects = textContent.match(/\{[^{}]*\}/g) || [];
-  
-  allObjects.forEach(m => {
-      try {
-          const obj = JSON.parse(m.replace(/,\s*[\]}]/g, res => res.slice(1)));
-          const keys = Object.keys(obj).map(k => k.toLowerCase());
-          
-          // Fuzzy Classifier (Semantic Matching for Assets only)
-          const isPage = keys.some(k => k.includes('title') || k.includes('url') || k.includes('link') || k.includes('page') || k.includes('asset') || k.includes('t'));
-
-          if (isPage) {
-            pageObjects.push({
-              title: obj.title || obj.t || obj.name || 'AI Asset',
-              url: obj.url || obj.u || obj.link || '#',
-              relevanceScore: obj.relevanceScore || obj.r || obj.impact || 85
-            });
+  const generationConfig = {
+    temperature: 0.0,
+    maxOutputTokens: 4096,
+    responseMimeType: "application/json",
+    responseSchema: {
+      type: "object",
+      properties: {
+        visibilityScore: { type: "number" },
+        verdict: { type: "string" },
+        pages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              url: { type: "string" },
+              type: { type: "string", enum: ["page", "product", "article"] },
+              relevanceScore: { type: "number" }
+            }
           }
-      } catch {}
-  });
-
-  let data: any = { pages: pageObjects, isRecovery: true };
-  try {
-    // 2. Advanced JSON "Repair" (Brace Balancer)
-    let repaired = jsonString;
-    const stack: string[] = [];
-    let inString = false;
-    for (let i = 0; i < repaired.length; i++) {
-        if (repaired[i] === '"' && repaired[i - 1] !== '\\') inString = !inString;
-        if (!inString) {
-            if (repaired[i] === '{' || repaired[i] === '[') stack.push(repaired[i] === '{' ? '}' : ']');
-            else if (repaired[i] === '}' || repaired[i] === ']') stack.pop();
         }
+      }
     }
-    while (stack.length > 0) repaired += stack.pop();
-    const parsed = JSON.parse(repaired.replace(/,\s*[\]}]/g, m => m.slice(1)));
-    
-    // 3. Hybrid Merge (Combine JSON results with Greedy results)
-    data = {
-      ...parsed,
-      pages: [...(parsed.pages || []), ...pageObjects].filter((v, i, a) => a.findIndex(t => t.url === v.url) === i),
-      isRecovery: parsed.isRecovery || allObjects.length > 0
-    };
-  } catch (err) {
-    console.warn('Hybrid parsing fallback used:', err);
-    data.verdict = verdictMatch ? verdictMatch[1] : 'Partial audit data recovered via hybrid pattern matching.';
-    data.visibilityScore = scoreMatch ? parseInt(scoreMatch[1]) : 75;
-  }
-  
-  // 5. Final Data Normalization Layer
+  };
+
+  const responseData = await callGeminiWithRetry(apiKey, prompt, 3, tools, generationConfig);
+  const textContent = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!textContent) throw new Error('Failed to get audit data from Gemini');
+
+  const data = JSON.parse(textContent);
   return {
-    domain: domain,
-    pages: (Array.isArray(data.pages) ? data.pages : []).slice(0, 7).map((p: any) => {
-      let score = Number(p.relevanceScore || 50);
-      if (score > 0 && score <= 1) score = Math.round(score * 100);
-      return {
-        title: String(p.title || 'Untitled'),
-        url: String(p.url || '#'),
-        type: p.type === 'product' || p.type === 'article' ? p.type : 'page',
-        relevanceScore: Math.min(100, Math.max(0, score)),
-      };
-    }),
-    visibilityScore: Number((data.visibilityScore || (scoreMatch ? parseInt(scoreMatch[1]) : 0)) > 1 ? (data.visibilityScore || (scoreMatch ? parseInt(scoreMatch[1]) : 0)) : (data.visibilityScore || (scoreMatch ? parseInt(scoreMatch[1]) : 0)) * 100 || 30),
-    verdict: String(data.verdict || verdictMatch?.[1]?.trim() || 'No verdict available.'),
-    recoveryUsed: !!data.isRecovery
+    domain,
+    pages: (data.pages || []).slice(0, 7).map((p: any) => ({
+      title: String(p.title || 'Untitled'),
+      url: String(p.url || '#'),
+      type: ['page','product','article'].includes(p.type) ? p.type : 'page',
+      relevanceScore: Math.min(100, Math.max(0, Number(p.relevanceScore || 50))),
+    })),
+    visibilityScore: Number(data.visibilityScore || 30),
+    verdict: String(data.verdict || 'No verdict available.'),
+    recoveryUsed: false,
   };
 }
 

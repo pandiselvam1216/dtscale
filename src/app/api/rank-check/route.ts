@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import Fuse from 'fuse.js';
-import { generateRankCheckFeedback } from '@/lib/gemini';
+import { generateRankCheckFeedback, urlsMatch } from '@/lib/gemini';
 
 export async function POST(request: NextRequest) {
   try {
@@ -44,28 +44,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Search context not found' }, { status: 404 });
     }
 
-    // Normalize URLs for comparison
-    const normalizeUrl = (url: string) => {
-      try {
-        const u = new URL(url.startsWith('http') ? url : `https://${url}`);
-        return u.hostname.replace('www.', '') + u.pathname.replace(/\/$/, '');
-      } catch {
-        return url.toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, '').replace(/\/$/, '');
-      }
-    };
+    // Use normalized matching function
+    let matchedResult = results.find((r) => urlsMatch(target_url, r.url));
 
-    const normalizedTarget = normalizeUrl(target_url);
-
-    // 1. Exact URL match
-    let matchedResult = results.find((r) => normalizeUrl(r.url) === normalizedTarget);
-
-    // 2. Domain match
-    if (!matchedResult) {
-      const targetDomain = normalizedTarget.split('/')[0];
-      matchedResult = results.find((r) => normalizeUrl(r.url).startsWith(targetDomain));
-    }
-
-    // 3. Fuzzy match using Fuse.js
+    // Fallback to fuzzy match using Fuse.js if no direct match found
     if (!matchedResult) {
       const fuse = new Fuse(results, {
         keys: ['url'],
